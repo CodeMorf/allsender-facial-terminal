@@ -278,8 +278,12 @@ export async function syncFaceTemplates(token: string, branchId: string): Promis
       last_sync_attempt: now,
       attendance_state: attendanceState,
     } satisfies LocalMeta);
+    const nativeStored = window.AllSenderAndroid?.storeFaceSync?.(JSON.stringify(payload));
+    if (nativeStored === false) {
+      transaction.abort();
+      throw new Error("No se pudo guardar la base facial nativa.");
+    }
     await transactionDone(transaction);
-    window.AllSenderAndroid?.storeFaceSync?.(JSON.stringify(payload));
     return { version: Number(payload.version) || meta.faces_version, upserted, deleted };
   } finally {
     db.close();
