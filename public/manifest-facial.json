@@ -1,0 +1,24 @@
+{
+  "name": "AllSender Facial",
+  "short_name": "AllSender Facial",
+  "description": "Terminal kiosk de asistencia facial para la sucursal asignada.",
+  "start_url": "/facial-terminal",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#050811",
+  "theme_color": "#050811",
+  "lang": "es-DO",
+  "dir": "ltr",
+  "prefer_related_applications": false,
+  "icons": [
+    { "src": "/pwa/icon-48.png", "sizes": "48x48", "type": "image/png" },
+    { "src": "/pwa/icon-72.png", "sizes": "72x72", "type": "image/png" },
+    { "src": "/pwa/icon-96.png", "sizes": "96x96", "type": "image/png" },
+    { "src": "/pwa/icon-128.png", "sizes": "128x128", "type": "image/png" },
+    { "src": "/pwa/icon-144.png", "sizes": "144x144", "type": "image/png" },
+    { "src": "/pwa/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/pwa/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/pwa/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
