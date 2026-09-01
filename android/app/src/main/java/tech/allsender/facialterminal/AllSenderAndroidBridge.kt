@@ -7,6 +7,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import androidx.room.withTransaction
 import org.json.JSONObject
 
 /**
@@ -65,6 +67,22 @@ class AllSenderAndroidBridge(context: Context) {
 
     @JavascriptInterface
     fun markPaired(token: String?, branchId: String?, terminalId: String?) {
+        val previousBranch = secureStore.getSecret("branch_id")
+        val previousTerminal = secureStore.getSecret("terminal_id")
+        if (!branchId.isNullOrBlank() &&
+            ((previousBranch != null && previousBranch != branchId) ||
+                (previousTerminal != null && previousTerminal != terminalId))
+        ) {
+            runBlocking(Dispatchers.IO) {
+                database.withTransaction {
+                    database.offlinePunches().clearAll()
+                    previousBranch?.let {
+                        database.faceTemplates().clearBranch(it)
+                        database.faceTemplates().clearMetadata(it)
+                    }
+                }
+            }
+        }
         if (!token.isNullOrBlank() && token.length >= 20) secureStore.putSecret("terminal_token", token)
         if (!branchId.isNullOrBlank()) secureStore.putSecret("branch_id", branchId)
         if (!terminalId.isNullOrBlank()) secureStore.putSecret("terminal_id", terminalId)
@@ -88,8 +106,7 @@ class AllSenderAndroidBridge(context: Context) {
         val payload = try { JSONObject(payloadJson) } catch (_: Exception) { return false }
         val branchId = payload.optString("branch_id")
         if (branchId.isBlank() || secureStore.getSecret("branch_id") != branchId) return false
-        scope.launch { persistFaceSyncPayload(appContext, payloadJson) }
-        return true
+        return runBlocking(Dispatchers.IO) { persistFaceSyncPayload(appContext, payloadJson) }
     }
 
     @JavascriptInterface
@@ -128,8 +145,15 @@ class AllSenderAndroidBridge(context: Context) {
 
     @JavascriptInterface
     fun clearPaired() {
-        scope.launch {
-            database.offlinePunches().clearAll()
+        val branchId = secureStore.getSecret("branch_id")
+        runBlocking(Dispatchers.IO) {
+            database.withTransaction {
+                database.offlinePunches().clearAll()
+                branchId?.let {
+                    database.faceTemplates().clearBranch(it)
+                    database.faceTemplates().clearMetadata(it)
+                }
+            }
             secureStore.clearTerminalSecrets()
         }
     }

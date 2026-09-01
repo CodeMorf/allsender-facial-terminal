@@ -383,7 +383,6 @@ export async function recognizeLocally(
   const templates = await listLocalFaceTemplates(context.token, context.branchId);
   const raw = await provider.recognize(imageDataUrl, {
     branch_id: context.branchId,
-    templates,
     image_width: context.imageWidth,
     image_height: context.imageHeight,
     landmarks: context.landmarks,

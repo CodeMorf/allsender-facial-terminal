@@ -10,6 +10,8 @@ import android.util.Base64
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
 import java.nio.FloatBuffer
@@ -51,7 +53,7 @@ object LocalFaceEngine {
         return try {
             val aligned = align(bitmap, landmarks)
             val candidate = infer(context, aligned)
-            compare(candidate, branchId, request.optJSONArray("templates"))
+            compare(candidate, branchId, loadTemplates(context, branchId))
         } finally {
             if (!bitmap.isRecycled) bitmap.recycle()
         }
@@ -200,6 +202,31 @@ object LocalFaceEngine {
         is Array<*> -> value.flatMap(::flatten)
         is Number -> listOf(value.toFloat())
         else -> emptyList()
+    }
+
+    /** Reads the encrypted branch catalog from Room; embeddings never cross the JS bridge. */
+    private fun loadTemplates(context: Context, branchId: String): JSONArray {
+        val rows = runBlocking(Dispatchers.IO) {
+            LocalDatabase.get(context).faceTemplates().forBranch(branchId)
+        }
+        val secureStore = SecureStore(context)
+        return JSONArray().also { result ->
+            rows.forEach { row ->
+                secureStore.decrypt(row.encryptedPayload)?.let { payload ->
+                    try {
+                        val item = JSONObject(payload)
+                        if (item.optString("branch_id") == branchId &&
+                            item.optString("model_name") == MODEL_NAME &&
+                            item.optBoolean("active", false)
+                        ) {
+                            result.put(item)
+                        }
+                    } catch (_: Exception) {
+                        // Ignore one corrupt local row; another authorized profile may still match.
+                    }
+                }
+            }
+        }
     }
 
     private fun compare(candidate: FloatArray, branchId: String, templates: JSONArray?): JSONObject? {

@@ -42,6 +42,9 @@ interface FaceTemplateDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(template: FaceTemplateEntity)
 
+    @Query("SELECT * FROM face_templates WHERE branchId = :branchId")
+    suspend fun forBranch(branchId: String): List<FaceTemplateEntity>
+
     @Query("DELETE FROM face_templates WHERE branchId = :branchId")
     suspend fun clearBranch(branchId: String)
 

@@ -72,6 +72,11 @@ catálogo local al sincronizar. Los perfiles antiguos enrolados únicamente con
 ArcFace/LBPH siguen siendo compatibles online, pero deben volver a registrarse
 con SFace para poder operar offline.
 
+En Android, el motor nativo lee las plantillas desde Room cifrado; el puente
+JavaScript solo entrega la captura y los puntos de alineación, nunca el
+catálogo biométrico. Al cambiar o desvincular la terminal se limpian los datos
+y eventos pendientes del vínculo anterior.
+
 ## Cliente Android dedicado
 
 La carpeta `android/` contiene la APK **AllSender Facial** versión `1.0.0`

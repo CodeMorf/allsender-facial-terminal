@@ -115,8 +115,8 @@ La PWA incluye el contrato `window.AllSenderFacialLocal`:
 
 ```ts
 window.AllSenderFacialLocal = {
-  async recognize(imageDataUrl, { branch_id, templates }) {
-    // El contenedor usa su modelo SFace local y estas plantillas en memoria.
+  async recognize(imageDataUrl, { branch_id, image_width, image_height, landmarks }) {
+    // El contenedor lee las plantillas cifradas de Room; no recibe embeddings por JS.
     return {
       employee_id: "...",
       confidence: 0.91,
@@ -142,15 +142,16 @@ ese aviso y revisar la procedencia de los pesos con el proveedor del modelo.
 
 Los enrolamientos, reinicios, desautorizaciones, bajas, reactivaciones y
 cambios de sucursal publican una revisión. Las terminales eliminan localmente
-las plantillas recibidas en `deleted`. Al desvincular una terminal, el cliente
-nativo debe borrar su almacén local y sus secretos.
+las plantillas recibidas en `deleted`. Al cambiar de sucursal/terminal o
+desvincular una terminal, el cliente nativo borra el almacén local, la cola
+pendiente y sus secretos antes de aceptar el nuevo vínculo.
 
-## Verificación pendiente antes de producción
+## Validación final antes de declarar autonomía completa
 
-La parte backend/PWA, el encoder SFace y la base local ya tienen compilación y
-pruebas de contrato. Falta probar en una tablet real el cliente Android con
-una persona autorizada y completar el E2E antes de publicar producción: con
-Internet caído,
+La parte backend/PWA, el encoder SFace y la base local ya tienen compilación,
+pruebas de contrato y una verificación controlada en el servidor. Falta probar
+en una tablet real el cliente Android con una persona autorizada y completar el
+E2E: con Internet caído,
 reconexión, reinicio, 100+ eventos, cambios de rostro, bajas, cambio de
 sucursal, duplicados y fallos parciales.
 
@@ -169,7 +170,8 @@ sucursal, duplicados y fallos parciales.
 | Reconocimiento local en una tablet | Pendiente E2E | No había dispositivo ADB conectado en el entorno de compilación |
 | 100+ eventos, reinicio, caída/reconexión y modelo cambiado | Pendiente E2E | Requiere el encoder y una tablet real |
 
-Por lo anterior, el código ya está preparado para reconocimiento offline real,
-pero la APK aún no debe llamarse producción hasta verificarla en una tablet
-Android real, volver a enrolar los perfiles que hoy solo son ArcFace/LBPH y
-confirmar el flujo completo de sincronización y marcaje.
+Por lo anterior, el código y el despliegue están preparados para reconocimiento
+offline real, pero la APK aún no debe llamarse autonomía completa hasta
+verificarla en una tablet Android real, volver a enrolar los perfiles que hoy
+solo son ArcFace/LBPH y confirmar el flujo completo de sincronización y
+marcaje.
