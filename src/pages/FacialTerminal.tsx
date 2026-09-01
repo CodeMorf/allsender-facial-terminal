@@ -3,6 +3,7 @@ import {
   BatteryCharging,
   Camera,
   CameraOff,
+  Check,
   Clock3,
   Coffee,
   Crosshair,
@@ -29,7 +30,19 @@ import {
   bindBeforeInstallPrompt,
   isStandaloneDisplay,
   triggerInstallPrompt,
-} from "@/lib/pwaFacial";
+} from "@/lib/pwaEmpleado";
+import {
+  clearLocalFaceData,
+  countPendingPunches,
+  flushOfflinePunches,
+  getLocalAutomaticAction,
+  hasLocalFaceEngine,
+  queueOfflinePunch,
+  recognizeLocally,
+  rememberOnlinePunch,
+  syncFaceTemplates,
+  newLocalEventId,
+} from "@/lib/facialOffline";
 
 type KioskState =
   | "idle"
@@ -67,6 +80,7 @@ type Config = {
     start: string | null;
     end: string | null;
     within_schedule: boolean;
+    lunch_minutes?: number | null;
   };
   automatic_punch?: {
     enabled: boolean;
@@ -89,15 +103,32 @@ type Candidate = {
   automatic_action?: AutomaticAction;
 };
 
+type OfflinePunchOptions = {
+  confidence: number;
+  device_timestamp: string;
+};
+
 type AllSenderAndroidBridge = {
   getBatteryPercent?: () => number;
   isCharging?: () => boolean;
   getPlatformLabel?: () => string;
+  getAppVersion?: () => string;
   getPairingCode?: () => string;
+  hasLocalFaceEngine?: () => boolean;
   clearPairingCode?: () => void;
-  markPaired?: () => void;
+  markPaired?: (token?: string, branchId?: string, terminalId?: string) => void;
   clearPaired?: () => void;
+  clearLocalFaceData?: (branchId: string) => void;
 };
+
+function cachedTerminalConfig(): Config | null {
+  try {
+    const raw = localStorage.getItem("allsender_facial_terminal_config");
+    return raw ? (JSON.parse(raw) as Config) : null;
+  } catch {
+    return null;
+  }
+}
 
 const TOKEN_KEY = "codemorf_facial_terminal_token";
 
@@ -107,7 +138,7 @@ function getAllSenderAndroidBridge(): AllSenderAndroidBridge | null {
 
 function getTerminalAppVersion() {
   try {
-    return getAllSenderAndroidBridge()?.getPlatformLabel?.() || "web-terminal-1";
+    return getAllSenderAndroidBridge()?.getAppVersion?.() || getAllSenderAndroidBridge()?.getPlatformLabel?.() || "web-terminal-1";
   } catch {
     return "web-terminal-1";
   }
@@ -188,10 +219,13 @@ async function publicApi(path: string, options: RequestInit = {}) {
   headers.set("Accept", "application/json");
   const response = await fetch(path, { ...options, headers });
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok)
-    throw new Error(
+  if (!response.ok) {
+    const error = new Error(
       payload.detail || payload.message || "No se pudo completar la operación.",
-    );
+    ) as Error & { status?: number };
+    error.status = response.status;
+    throw error;
+  }
   return payload;
 }
 
@@ -217,7 +251,7 @@ export default function FacialTerminal() {
   const [token, setToken] = useState(
     () => localStorage.getItem(TOKEN_KEY) || "",
   );
-  const [config, setConfig] = useState<Config | null>(null);
+  const [config, setConfig] = useState<Config | null>(() => cachedTerminalConfig());
   const [pairingStep, setPairingStep] = useState<PairingStep>("gps");
   const [pairingLocation, setPairingLocation] = useState<{
     latitude: number;
@@ -232,6 +266,8 @@ export default function FacialTerminal() {
   const [state, setState] = useState<KioskState>("idle");
   const [candidate, setCandidate] = useState<Candidate | null>(null);
   const [authToken, setAuthToken] = useState("");
+  const [punchType, setPunchType] =
+    useState<(typeof PUNCHES)[number]["id"]>("entrada");
   const [message, setMessage] = useState(
     "Acércate a la pantalla para marcar tu asistencia",
   );
@@ -239,16 +275,16 @@ export default function FacialTerminal() {
   const [battery, setBattery] = useState<number | null>(null);
   const [charging, setCharging] = useState(false);
   const [online, setOnline] = useState(navigator.onLine);
+  const [syncState, setSyncState] = useState<"idle" | "syncing" | "ok" | "error">("idle");
+  const [pendingOffline, setPendingOffline] = useState(0);
+  const [localFaceEngine, setLocalFaceEngine] = useState(hasLocalFaceEngine);
   const [cameraOn, setCameraOn] = useState(false);
   const [cameraError, setCameraError] = useState("");
   const [liveFaceState, setLiveFaceState] = useState<LiveFaceState>("none");
   const [liveFaceMessage, setLiveFaceMessage] = useState(
     "Acércate a la cámara para registrar tu asistencia",
   );
-  // La terminal permanece silenciosa por defecto. El operador puede activar
-  // la voz únicamente si la operación de la sucursal lo necesita.
   const [audio, setAudio] = useState(false);
-  const [lastCompletedPunch, setLastCompletedPunch] = useState<PunchType | null>(null);
   const [installReady, setInstallReady] = useState(false);
   const [installed, setInstalled] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -256,6 +292,7 @@ export default function FacialTerminal() {
   const streamRef = useRef<MediaStream | null>(null);
   const faceLandmarkerRef = useRef<FaceLandmarkerType | null>(null);
   const faceRafRef = useRef<number | null>(null);
+  const latestFaceLandmarksRef = useRef<Array<{ x: number; y: number }> | null>(null);
   const liveFaceStateRef = useRef<LiveFaceState>("none");
   const recognizeTimer = useRef<number | null>(null);
   const busyRecognition = useRef(false);
@@ -267,6 +304,7 @@ export default function FacialTerminal() {
   const batteryRef = useRef<number | null>(null);
   const chargingRef = useRef(false);
   const locationRef = useRef<{ latitude: number; longitude: number } | null>(null);
+  const localSyncBusyRef = useRef(false);
   const facialEnabled = Boolean(config?.facial_enabled);
 
   const updateBatteryReading = useCallback(
@@ -312,12 +350,6 @@ export default function FacialTerminal() {
     window.speechSynthesis.speak(utterance);
   }, [audio, statusMessage, token]);
 
-  useEffect(() => {
-    if (!audio && "speechSynthesis" in window) {
-      window.speechSynthesis.cancel();
-    }
-  }, [audio]);
-
   const stopCamera = useCallback(() => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
@@ -359,6 +391,8 @@ export default function FacialTerminal() {
         headers: { "X-Facial-Terminal-Token": value },
       });
       setConfig(result);
+      localStorage.setItem("allsender_facial_terminal_config", JSON.stringify(result));
+      setOnline(true);
       if (batteryRef.current === null) {
         updateBatteryReading(
           result.terminal?.battery_percent ?? null,
@@ -406,8 +440,8 @@ export default function FacialTerminal() {
     ) as HTMLMetaElement | null;
     if (theme) theme.content = "#050811";
     if ("serviceWorker" in navigator) {
-        navigator.serviceWorker
-        .register("/sw-facial-terminal.js", { scope: "/", updateViaCache: "none" })
+      navigator.serviceWorker
+        .register("/sw-empleado.js", { scope: "/", updateViaCache: "none" })
         .then((registration) => registration.update())
         .catch(() => undefined);
     }
@@ -426,11 +460,22 @@ export default function FacialTerminal() {
     };
   }, []);
   useEffect(() => {
-    if (token)
-      loadConfig().catch(() => {
-        localStorage.removeItem(TOKEN_KEY);
-        setToken("");
+    if (token) {
+      loadConfig().catch((cause) => {
+        const status = (cause as Error & { status?: number })?.status;
+        if (status === 401 || status === 403 || status === 409) {
+          const previousBranchId = cachedTerminalConfig()?.branch?.id || "";
+          void clearLocalFaceData(previousBranchId).catch(() => undefined);
+          localStorage.removeItem(TOKEN_KEY);
+          localStorage.removeItem("allsender_facial_terminal_config");
+          setToken("");
+          setConfig(null);
+          return;
+        }
+        setOnline(false);
+        setMessage("Sin conexión con el backend · se conserva la configuración local de esta terminal.");
       });
+    }
   }, [loadConfig, token]);
   useEffect(() => {
     if (token && config && !cameraOn) startCamera().catch(() => undefined);
@@ -506,13 +551,33 @@ export default function FacialTerminal() {
             const result = landmarker.detectForVideo(video, performance.now());
             const count = result.faceLandmarks?.length || 0;
             if (count === 1) {
+              const face = result.faceLandmarks[0];
+              const point = (index: number) => face?.[index];
+              const average = (first: number, second: number) => {
+                const a = point(first);
+                const b = point(second);
+                return a && b ? { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 } : null;
+              };
+              const landmarks = [
+                average(33, 133),
+                average(362, 263),
+                point(1),
+                point(61),
+                point(291),
+              ];
+              latestFaceLandmarksRef.current = landmarks.every(Boolean)
+                ? landmarks as Array<{ x: number; y: number }>
+                : null;
               updateLiveFace("one", "Rostro detectado · verificando autorización…");
             } else if (count > 1) {
+              latestFaceLandmarksRef.current = null;
               updateLiveFace("multiple", "Solo debe aparecer una persona frente a la cámara");
             } else {
+              latestFaceLandmarksRef.current = null;
               updateLiveFace("none", "Acércate a la cámara para registrar tu asistencia");
             }
           } catch {
+            latestFaceLandmarksRef.current = null;
             updateLiveFace("error", "Detección en vivo no disponible · verificando en servidor…");
           }
           faceRafRef.current = requestAnimationFrame(loop);
@@ -538,6 +603,7 @@ export default function FacialTerminal() {
         /* */
       }
       faceLandmarkerRef.current = null;
+      latestFaceLandmarksRef.current = null;
     };
   }, [cameraOn, facialEnabled, updateLiveFace]);
 
@@ -556,6 +622,7 @@ export default function FacialTerminal() {
         }),
       });
       setConfig(result.config);
+      localStorage.setItem("allsender_facial_terminal_config", JSON.stringify(result.config));
       setOnline(true);
       if (batteryRef.current === null && result.config?.terminal?.battery_percent != null) {
         updateBatteryReading(
@@ -572,10 +639,68 @@ export default function FacialTerminal() {
       } else if (result.config?.terminal?.within_branch_zone === true) {
         setState((current) => (current === "out_of_zone" ? "idle" : current));
       }
-    } catch {
+    } catch (cause) {
+      const status = (cause as Error & { status?: number })?.status;
+      if (status === 401 || status === 403 || status === 409) {
+        const previousBranchId = config?.branch.id || "";
+        void clearLocalFaceData(previousBranchId).catch(() => undefined);
+        localStorage.removeItem(TOKEN_KEY);
+        localStorage.removeItem("allsender_facial_terminal_config");
+        setToken("");
+        setConfig(null);
+        setSyncState("error");
+        return;
+      }
       setOnline(false);
     }
-  }, [token, updateBatteryReading]);
+  }, [config, token, updateBatteryReading]);
+
+  const branchId = config?.branch.id || "";
+  const syncLocalData = useCallback(async () => {
+    if (!token || !branchId || localSyncBusyRef.current) return;
+    localSyncBusyRef.current = true;
+    setLocalFaceEngine(hasLocalFaceEngine());
+    setSyncState("syncing");
+    try {
+      // Primero se entrega lo que la tablet pudo registrar offline; después
+      // se refresca la autorización facial y se hace un segundo drenaje por
+      // si durante la sincronización nació otro evento pendiente.
+      await flushOfflinePunches(token, branchId);
+      await syncFaceTemplates(token, branchId);
+      await flushOfflinePunches(token, branchId);
+      setPendingOffline(await countPendingPunches(branchId));
+      setOnline(true);
+      setSyncState("ok");
+    } catch (cause) {
+      setPendingOffline(await countPendingPunches(branchId).catch(() => 0));
+      setSyncState("error");
+      const status = (cause as Error & { status?: number })?.status;
+      if (status === 401 || status === 403 || status === 409) {
+        void clearLocalFaceData(branchId).catch(() => undefined);
+        localStorage.removeItem(TOKEN_KEY);
+        localStorage.removeItem("allsender_facial_terminal_config");
+        setToken("");
+        setConfig(null);
+        return;
+      }
+      setOnline(false);
+    } finally {
+      localSyncBusyRef.current = false;
+    }
+  }, [branchId, token]);
+
+  useEffect(() => {
+    if (!token || !branchId) return;
+    void syncLocalData();
+    const interval = window.setInterval(() => void syncLocalData(), 5 * 60_000);
+    const onOnline = () => void syncLocalData();
+    window.addEventListener("online", onOnline);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("online", onOnline);
+    };
+  }, [branchId, syncLocalData, token]);
+
   useEffect(() => {
     if (!token) return;
     const initialTimer = window.setTimeout(() => void sendHeartbeat(), 750);
@@ -673,7 +798,11 @@ export default function FacialTerminal() {
       setPin("");
       try {
         const bridge = getAllSenderAndroidBridge();
-        bridge?.markPaired?.();
+        bridge?.markPaired?.(
+          result.terminal_token,
+          result.config?.branch?.id,
+          result.config?.terminal?.id,
+        );
         bridge?.clearPairingCode?.();
       } catch {
         // El navegador continúa operando si no existe el puente Android.
@@ -752,6 +881,7 @@ export default function FacialTerminal() {
         latitude: position.coords.latitude,
         longitude: position.coords.longitude,
       };
+      locationRef.current = location;
       setPairingLocation(location);
       setPairingStep("pin");
       try {
@@ -791,7 +921,6 @@ export default function FacialTerminal() {
     punchTimerRef.current = window.setTimeout(() => {
       setCandidate(null);
       setAuthToken("");
-      setLastCompletedPunch(null);
       setState("idle");
       setMessage("Acércate a la cámara para registrar tu asistencia");
       punchTimerRef.current = null;
@@ -799,12 +928,39 @@ export default function FacialTerminal() {
   }, []);
 
   const recordPunch = useCallback(
-    async (employee: Candidate, credential: string, eventType: PunchType) => {
-      if (!credential || !token) return;
+    async (
+      employee: Candidate,
+      credential: string,
+      eventType: PunchType,
+      offlineOptions?: OfflinePunchOptions,
+    ) => {
+      if ((!credential && !offlineOptions) || !token || !config) return;
       const eventLabel = PUNCHES.find((item) => item.id === eventType)?.label || eventType.toUpperCase();
       setState("recognizing");
       setMessage(`Rostro autorizado · registrando ${eventLabel.toLowerCase()} automáticamente…`);
       try {
+        if (offlineOptions) {
+          await queueOfflinePunch({
+            local_event_id: newLocalEventId(`offline-${config.terminal.id}`),
+            employee_id: employee.id,
+            branch_id: config.branch.id,
+            terminal_id: config.terminal.id,
+            device_timestamp: offlineOptions.device_timestamp,
+            event_type: eventType,
+            confidence: offlineOptions.confidence,
+            mode: "OFFLINE",
+            latitude: locationRef.current?.latitude ?? null,
+            longitude: locationRef.current?.longitude ?? null,
+            device_metadata: { app_version: getTerminalAppVersion(), source: "pwa" },
+          });
+          setPendingOffline(await countPendingPunches(config.branch.id));
+          punchCooldownUntilRef.current = Date.now() + PUNCH_COOLDOWN_MS;
+          setOnline(false);
+          setState("success");
+          setMessage(`${eventLabel} guardada localmente. Se sincronizará cuando vuelva la conexión.`);
+          resetTerminal(4_000);
+          return;
+        }
         const result = await publicApi("/api/v1/facial/terminals/punch", {
           method: "POST",
           headers: { "X-Facial-Terminal-Token": token },
@@ -814,8 +970,20 @@ export default function FacialTerminal() {
             event_type: eventType,
           }),
         });
+        await rememberOnlinePunch({
+          local_event_id: newLocalEventId(`online-${config.terminal.id}`),
+          employee_id: employee.id,
+          branch_id: config.branch.id,
+          terminal_id: config.terminal.id,
+          device_timestamp: new Date().toISOString(),
+          event_type: eventType,
+          confidence: 0,
+          mode: "ONLINE",
+          latitude: locationRef.current?.latitude ?? null,
+          longitude: locationRef.current?.longitude ?? null,
+          device_metadata: { app_version: getTerminalAppVersion(), source: "pwa" },
+        }).catch(() => undefined);
         punchCooldownUntilRef.current = Date.now() + PUNCH_COOLDOWN_MS;
-        setLastCompletedPunch(eventType);
         setState("success");
         setMessage(result.message || `${eventLabel} registrada correctamente.`);
         resetTerminal(4_000);
@@ -829,7 +997,7 @@ export default function FacialTerminal() {
         resetTerminal(2_500);
       }
     },
-    [resetTerminal, token],
+    [config, resetTerminal, token],
   );
 
   const recognize = useCallback(async () => {
@@ -841,7 +1009,7 @@ export default function FacialTerminal() {
       busyRecognition.current ||
       !videoRef.current ||
       !canvasRef.current ||
-      !config.schedule.within_schedule ||
+      (online && !config.schedule.within_schedule) ||
       Date.now() < punchCooldownUntilRef.current ||
       (liveFaceState !== "one" && liveFaceState !== "error")
     ) {
@@ -856,11 +1024,74 @@ export default function FacialTerminal() {
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
     canvas.getContext("2d")?.drawImage(video, 0, 0);
+    const image = canvas.toDataURL("image/jpeg", 0.82);
+    const handleLocalRecognition = async (): Promise<boolean> => {
+      if (!config || !hasLocalFaceEngine()) return false;
+      const local = await recognizeLocally(image, {
+        token,
+        branchId: config.branch.id,
+        imageWidth: video.videoWidth,
+        imageHeight: video.videoHeight,
+        landmarks: latestFaceLandmarksRef.current || undefined,
+      });
+      if (!local) return false;
+      const localAction = await getLocalAutomaticAction(
+        local.employee_id,
+        config.branch.id,
+        config.schedule,
+        config.automatic_punch,
+      );
+      const automaticAction: AutomaticAction = {
+        enabled: true,
+        available: localAction.available,
+        event_type: localAction.event_type,
+        label: localAction.label,
+        description: localAction.description,
+        reason: localAction.reason,
+      };
+      const employee = {
+        id: local.template.employee_id,
+        name: local.template.name,
+        code: local.template.code,
+        automatic_action: automaticAction,
+      } as Candidate;
+      setCandidate(employee);
+      setAuthToken("");
+      if (localAction.event_type) setPunchType(localAction.event_type);
+      setState("recognized");
+      if (localAction.available && localAction.event_type) {
+        setMessage(
+          `✅ ${employee.name} · rostro autorizado localmente · ${localAction.label}. Guardando sin conexión…`,
+        );
+        punchTimerRef.current = window.setTimeout(() => {
+          void recordPunch(employee, "", localAction.event_type as PunchType, {
+            confidence: local.confidence,
+            device_timestamp: new Date().toISOString(),
+          });
+        }, AUTO_PUNCH_DELAY_MS);
+      } else {
+        setMessage(`✅ ${employee.name} · autorizado localmente. ${localAction.reason || "No hay que marcar ahora."}`);
+        punchCooldownUntilRef.current = Date.now() + 4_500;
+        resetTerminal(4_500);
+      }
+      return true;
+    };
     try {
+      if (!online) {
+        if (await handleLocalRecognition()) return;
+        setState("error");
+        setMessage(
+          hasLocalFaceEngine()
+            ? "No se pudo reconocer el rostro localmente. Intenta con mejor luz."
+            : "Sin Internet · esta terminal aún no tiene un motor facial local compatible.",
+        );
+        resetTerminal(2_500);
+        return;
+      }
       const result = await publicApi("/api/v1/facial/terminals/identify", {
         method: "POST",
         headers: { "X-Facial-Terminal-Token": token },
-        body: JSON.stringify({ image: canvas.toDataURL("image/jpeg", 0.82) }),
+        body: JSON.stringify({ image }),
       });
       if (result.status === "recognized") {
         const automaticAction = result.automatic_action as
@@ -870,6 +1101,7 @@ export default function FacialTerminal() {
         const employee = { ...result.employee, automatic_action: automaticAction } as Candidate;
         setCandidate(employee);
         setAuthToken(result.auth_token);
+        if (nextEvent) setPunchType(nextEvent);
         setState("recognized");
 
         if (automaticAction?.enabled && automaticAction.available && nextEvent) {
@@ -886,11 +1118,7 @@ export default function FacialTerminal() {
           punchCooldownUntilRef.current = Date.now() + 4_500;
           resetTerminal(4_500);
         } else {
-          setMessage(
-            "Identidad confirmada · el modo automático no está activo en esta sucursal.",
-          );
-          punchCooldownUntilRef.current = Date.now() + 4_500;
-          resetTerminal(4_500);
+          setMessage("Identidad confirmada · selecciona el tipo de marcaje.");
         }
       } else if (result.status === "out_of_schedule") {
         setState("out_of_schedule");
@@ -905,6 +1133,12 @@ export default function FacialTerminal() {
         resetTerminal(2_200);
       }
     } catch (cause) {
+      setOnline(false);
+      try {
+        if (await handleLocalRecognition()) return;
+      } catch {
+        // El fallo del motor local no debe ocultar el error operativo.
+      }
       setState("error");
       setMessage(
         cause instanceof Error
@@ -915,7 +1149,7 @@ export default function FacialTerminal() {
     } finally {
       busyRecognition.current = false;
     }
-  }, [cameraOn, config, liveFaceState, recordPunch, resetTerminal, state, token]);
+  }, [cameraOn, config, liveFaceState, online, recordPunch, resetTerminal, state, token]);
 
   useEffect(() => {
     if (!token || !cameraOn) return;
@@ -925,8 +1159,14 @@ export default function FacialTerminal() {
     };
   }, [token, cameraOn, recognize]);
 
+  function punch() {
+    if (!candidate || !authToken) return;
+    void recordPunch(candidate, authToken, punchType);
+  }
   function lock() {
+    const previousBranchId = config?.branch.id || "";
     stopCamera();
+    void clearLocalFaceData(previousBranchId).catch(() => undefined);
     localStorage.removeItem(TOKEN_KEY);
     try {
       getAllSenderAndroidBridge()?.clearPaired?.();
@@ -950,15 +1190,8 @@ export default function FacialTerminal() {
     else void document.exitFullscreen().catch(() => undefined);
   }
 
-  const automaticConfigured = Boolean(config?.automatic_punch?.enabled);
-  const automaticAction = candidate?.automatic_action;
-  const activeAutomaticType =
-    state === "success"
-      ? lastCompletedPunch
-      : automaticAction?.event_type || null;
-  const activeAutomaticIndex = activeAutomaticType
-    ? PUNCHES.findIndex((item) => item.id === activeAutomaticType)
-    : -1;
+  const selected = PUNCHES.find((item) => item.id === punchType) || PUNCHES[0];
+  const automaticMode = Boolean(config?.automatic_punch?.enabled);
   const statusColor =
     state === "success"
       ? "border-emerald-400 shadow-emerald-500/30"
@@ -1127,11 +1360,10 @@ export default function FacialTerminal() {
     );
 
   return (
-    <div className="cyber-shell relative flex h-screen w-screen select-none flex-col overflow-hidden bg-[#050811] font-sans text-slate-100">
-      <div className="cyber-grid pointer-events-none absolute inset-0 opacity-80" />
+    <div className="relative flex h-screen w-screen select-none flex-col overflow-hidden bg-[#050811] font-sans text-slate-100">
       <div className="pointer-events-none absolute -left-32 -top-32 h-96 w-96 rounded-full bg-cyan-600/10 blur-3xl" />
       <div className="pointer-events-none absolute -bottom-32 -right-32 h-96 w-96 rounded-full bg-blue-600/10 blur-3xl" />
-      <header className="z-20 flex w-full items-center justify-between border-b border-cyan-400/20 bg-slate-950/80 px-4 py-3 shadow-[0_8px_32px_rgba(2,8,23,.55)] backdrop-blur-xl sm:px-6">
+      <header className="z-20 flex w-full items-center justify-between border-b border-cyan-500/20 bg-slate-950/75 px-4 py-3 shadow-2xl backdrop-blur-xl sm:px-6">
         <div className="flex min-w-0 items-center gap-3">
           <div className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-gradient-to-tr from-cyan-600 to-blue-500">
             <div className="grid h-full w-full place-items-center rounded-[10px] bg-slate-950">
@@ -1170,6 +1402,12 @@ export default function FacialTerminal() {
             )}
             {online ? "Online" : "Offline"}
           </span>
+          <span
+            title="Estado de sincronización local"
+            className={`hidden items-center gap-1 rounded-xl border px-2 py-1.5 text-[10px] font-semibold sm:inline-flex ${syncState === "syncing" ? "border-cyan-400/40 text-cyan-300" : pendingOffline > 0 ? "border-amber-400/40 text-amber-300" : syncState === "error" ? "border-rose-400/40 text-rose-300" : "border-slate-800 text-slate-400"}`}
+          >
+            {syncState === "syncing" ? "SINCRONIZANDO" : pendingOffline > 0 ? `${pendingOffline} PENDIENTE${pendingOffline === 1 ? "" : "S"}` : localFaceEngine ? "LOCAL LISTO" : "LOCAL NO DISPONIBLE"}
+          </span>
           <span className="flex items-center gap-1 rounded-xl border border-slate-800 bg-slate-900/80 px-2 py-1.5 text-xs">
             <BatteryCharging
               className={
@@ -1189,11 +1427,9 @@ export default function FacialTerminal() {
             <ShieldAlert size={17} />
           </button>
           <button
-            title={audio ? "Desactivar sonido" : "Activar sonido solo si es obligatorio"}
-            aria-label={audio ? "Desactivar sonido" : "Activar sonido solo si es obligatorio"}
-            aria-pressed={audio}
+            title="Sonido"
             onClick={() => setAudio((value) => !value)}
-            className={`rounded-xl border p-2 transition ${audio ? "border-amber-400/50 bg-amber-400/10 text-amber-300" : "border-slate-800 bg-slate-900/80 text-slate-400 hover:border-cyan-400/50 hover:text-cyan-300"}`}
+            className="hidden rounded-xl border border-slate-800 bg-slate-900/80 p-2 text-slate-300 sm:block"
           >
             {audio ? <Volume2 size={17} /> : <VolumeX size={17} />}
           </button>
@@ -1219,9 +1455,6 @@ export default function FacialTerminal() {
           />
           <canvas ref={canvasRef} className="hidden" />
           <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-slate-950/35 via-transparent to-slate-950/80" />
-          <div className="pointer-events-none absolute inset-0 z-[1] overflow-hidden opacity-70">
-            <div className="cyber-scanline absolute inset-x-0 -top-1/4 h-1/3" />
-          </div>
           {!cameraOn && (
             <div className="z-10 flex flex-col items-center p-6 text-center">
               <CameraOff className="mb-3 text-rose-400" size={42} />
@@ -1240,7 +1473,7 @@ export default function FacialTerminal() {
             </div>
           )}
           <div
-              className={`relative z-10 flex h-64 w-52 items-center justify-center rounded-[42px] border-2 bg-slate-950/10 sm:h-80 sm:w-64 ${state === "success" ? "border-emerald-400 shadow-[0_0_40px_rgba(34,197,94,.45)]" : state === "error" || state === "out_of_zone" ? "border-rose-500 shadow-[0_0_40px_rgba(244,63,94,.35)]" : state === "recognized" ? "border-emerald-300 shadow-[0_0_40px_rgba(52,211,153,.45)]" : liveFaceState === "multiple" ? "border-rose-400" : "border-dashed border-cyan-400/50 shadow-[0_0_30px_rgba(34,211,238,.12)]"}`}
+              className={`relative z-10 flex h-64 w-52 items-center justify-center rounded-[42px] border-2 sm:h-80 sm:w-64 ${state === "success" ? "border-emerald-400 shadow-[0_0_40px_rgba(34,197,94,.45)]" : state === "error" || state === "out_of_zone" ? "border-rose-500 shadow-[0_0_40px_rgba(244,63,94,.35)]" : state === "recognized" ? "border-emerald-300 shadow-[0_0_40px_rgba(52,211,153,.45)]" : liveFaceState === "multiple" ? "border-rose-400" : "border-dashed border-cyan-400/50"}`}
           >
             <div className="absolute inset-7 rounded-full border border-cyan-300/30" />
             <div
@@ -1312,51 +1545,40 @@ export default function FacialTerminal() {
       </main>
       <footer className="z-20 w-full px-3 pb-3 sm:px-6">
         <div className="mx-auto max-w-5xl">
-          <div className="rounded-2xl border border-cyan-400/30 bg-slate-950/80 p-3 shadow-[0_0_28px_rgba(8,145,178,.12)] sm:p-4">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div>
-                <p className="text-[10px] font-black uppercase tracking-[0.24em] text-cyan-300">
-                  FLUJO AUTOMÁTICO · ALLSENDER FACIAL
-                </p>
-                <p className="mt-1 text-xs text-slate-400">
-                  La terminal consulta tu asistencia real y decide el siguiente marcaje.
-                </p>
-              </div>
-              <span className={`rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider ${automaticConfigured ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-300" : "border-amber-400/40 bg-amber-400/10 text-amber-300"}`}>
-                {automaticConfigured ? "AUTOMÁTICO ACTIVO" : "REQUIERE ACTIVACIÓN"}
-              </span>
+          {automaticMode && (
+            <div className="rounded-2xl border border-indigo-400/40 bg-indigo-950/50 p-4 text-center">
+              <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-indigo-300">
+                MODO FÁCIL ACTIVADO
+              </p>
+              <p className="mt-1 text-xs text-slate-300">
+                La tablet elegirá el siguiente paso según tu asistencia y el
+                horario.
+              </p>
             </div>
-            <div className="mt-3 grid grid-cols-4 gap-1.5 sm:gap-2">
-              {PUNCHES.map((item, index) => {
+          )}
+          {!automaticMode && (
+            <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4 sm:gap-3">
+              {PUNCHES.map((item) => {
                 const Icon = item.icon;
                 const style = PUNCH_STYLES[item.color];
-                const isCurrent = activeAutomaticIndex === index && state !== "success";
-                const isCompleted = activeAutomaticIndex > index || (state === "success" && activeAutomaticIndex === index);
+                const active = punchType === item.id;
                 return (
-                  <div
+                  <button
                     key={item.id}
-                    className={`relative rounded-xl border p-2 text-center transition sm:p-3 ${isCurrent ? `${style.border} bg-cyan-500/10 shadow-[0_0_18px_rgba(34,211,238,.15)]` : isCompleted ? "border-emerald-400/40 bg-emerald-500/10" : "border-slate-800 bg-slate-900/50"}`}
+                    type="button"
+                    disabled={pairingBusy}
+                    aria-pressed={active}
+                    onClick={() => setPunchType(item.id)}
+                    className={`rounded-2xl border-2 p-3 text-left transition active:scale-95 ${active ? `${style.border} bg-slate-900/90` : "border-slate-800 bg-slate-900/60"} ${pairingBusy ? "cursor-not-allowed opacity-45" : "hover:border-slate-600"}`}
                   >
-                    <Icon className={`mx-auto mb-1 ${isCurrent ? style.text : isCompleted ? "text-emerald-300" : "text-slate-500"}`} size={17} />
-                    <p className={`text-[10px] font-black sm:text-xs ${isCurrent ? "text-cyan-200" : isCompleted ? "text-emerald-200" : "text-slate-400"}`}>
-                      {item.label}
-                    </p>
-                    <p className="mt-0.5 hidden text-[9px] text-slate-500 sm:block">{item.desc}</p>
-                    {isCurrent && <span className="absolute -right-1 -top-1 h-2 w-2 animate-pulse rounded-full bg-cyan-300" />}
-                  </div>
+                    <Icon className={`mb-1 ${style.text}`} size={20} />
+                    <p className="text-sm font-black">{item.label}</p>
+                    <p className="text-[10px] text-slate-400">{item.desc}</p>
+                  </button>
                 );
               })}
             </div>
-            <p className="mt-3 text-center text-[11px] text-slate-400">
-              {state === "success" && lastCompletedPunch
-                ? `${PUNCHES.find((item) => item.id === lastCompletedPunch)?.label} registrado. La terminal vuelve a esperar.`
-                : automaticAction?.event_type
-                  ? `Siguiente paso: ${automaticAction.label}. ${automaticAction.description || "Colócate frente a la cámara."}`
-                  : automaticConfigured
-                    ? automaticAction?.reason || "Acércate a la cámara; el sistema indicará cuándo corresponde marcar."
-                    : "Activa el reconocimiento automático en la configuración de esta sucursal para eliminar la selección manual."}
-            </p>
-          </div>
+          )}
           <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-800 bg-slate-950/80 px-3 py-2">
             <div className="flex items-center gap-2 text-xs text-slate-400">
               <Crosshair size={14} className="text-cyan-400" />
@@ -1365,6 +1587,15 @@ export default function FacialTerminal() {
               {config.schedule.end || "—"}
               {config.terminal.within_branch_zone === false ? " · Tablet fuera de zona" : " · Tablet en zona"}
             </div>
+            {state === "recognized" && !automaticMode && candidate && (
+                <button
+                  onClick={() => void punch()}
+                  className="rounded-xl bg-emerald-500 px-4 py-2 text-xs font-black text-slate-950"
+                >
+                  <Check className="mr-1 inline" size={15} />
+                  Confirmar {selected.label}
+                </button>
+              )}
             <span className="text-[10px] text-slate-500">
               {config.battery.alert_enabled
                 ? `Alerta ≤${config.battery.threshold}%`
