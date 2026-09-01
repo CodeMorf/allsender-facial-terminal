@@ -52,6 +52,8 @@ export type LocalFaceMatch = {
   employee_id: string;
   confidence: number;
   engine: string;
+  name?: string;
+  code?: string;
 };
 
 export type LocalAutomaticAction = {
@@ -388,8 +390,18 @@ export async function recognizeLocally(
     landmarks: context.landmarks,
   });
   if (!raw || !raw.employee_id || !Number.isFinite(raw.confidence) || raw.confidence < LOCAL_FACE_THRESHOLD) return null;
-  const template = templates.find((item) => item.employee_id === raw.employee_id);
-  if (!template) return null;
+  const template = templates.find((item) => item.employee_id === raw.employee_id) || {
+    employee_id: raw.employee_id,
+    branch_id: context.branchId,
+    name: raw.name || raw.employee_id,
+    code: raw.code || "",
+    model_name: LOCAL_FACE_MODEL,
+    version: 0,
+    updated_at: null,
+    active: true,
+    template_hash: "",
+    embeddings: [],
+  } satisfies LocalFaceTemplate;
   return {
     employee_id: template.employee_id,
     confidence: raw.confidence,
@@ -613,12 +625,11 @@ declare global {
         imageDataUrl: string,
         context: {
           branch_id: string;
-          templates: LocalFaceTemplate[];
           image_width?: number;
           image_height?: number;
           landmarks?: Array<{ x: number; y: number }>;
         },
-      ) => Promise<{ employee_id: string; confidence: number; engine?: string } | null> | { employee_id: string; confidence: number; engine?: string } | null;
+      ) => Promise<{ employee_id: string; confidence: number; engine?: string; name?: string; code?: string } | null> | { employee_id: string; confidence: number; engine?: string; name?: string; code?: string } | null;
     };
   }
 }

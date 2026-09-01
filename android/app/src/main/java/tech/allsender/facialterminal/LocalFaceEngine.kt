@@ -232,6 +232,8 @@ object LocalFaceEngine {
     private fun compare(candidate: FloatArray, branchId: String, templates: JSONArray?): JSONObject? {
         if (candidate.size != 128 || templates == null) return null
         var bestId: String? = null
+        var bestName: String? = null
+        var bestCode: String? = null
         var best = -1f
         var second = -1f
         for (index in 0 until templates.length()) {
@@ -261,6 +263,8 @@ object LocalFaceEngine {
                     second = best
                     best = score
                     bestId = item.optString("employee_id").takeIf { it.isNotBlank() }
+                    bestName = item.optString("name").takeIf { it.isNotBlank() }
+                    bestCode = item.optString("code").takeIf { it.isNotBlank() }
                 } else if (score > second) {
                     second = score
                 }
@@ -269,6 +273,8 @@ object LocalFaceEngine {
         if (bestId == null || best < SIMILARITY_THRESHOLD || (second >= 0f && best - second < MIN_MARGIN)) return null
         return JSONObject()
             .put("employee_id", bestId)
+            .put("name", bestName.orEmpty())
+            .put("code", bestCode.orEmpty())
             .put("confidence", best.toDouble())
             .put("engine", MODEL_NAME)
     }
