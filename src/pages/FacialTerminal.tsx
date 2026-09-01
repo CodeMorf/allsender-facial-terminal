@@ -3,7 +3,6 @@ import {
   BatteryCharging,
   Camera,
   CameraOff,
-  Check,
   Clock3,
   Coffee,
   Crosshair,
@@ -233,8 +232,6 @@ export default function FacialTerminal() {
   const [state, setState] = useState<KioskState>("idle");
   const [candidate, setCandidate] = useState<Candidate | null>(null);
   const [authToken, setAuthToken] = useState("");
-  const [punchType, setPunchType] =
-    useState<(typeof PUNCHES)[number]["id"]>("entrada");
   const [message, setMessage] = useState(
     "Acércate a la pantalla para marcar tu asistencia",
   );
@@ -248,7 +245,10 @@ export default function FacialTerminal() {
   const [liveFaceMessage, setLiveFaceMessage] = useState(
     "Acércate a la cámara para registrar tu asistencia",
   );
-  const [audio, setAudio] = useState(true);
+  // La terminal permanece silenciosa por defecto. El operador puede activar
+  // la voz únicamente si la operación de la sucursal lo necesita.
+  const [audio, setAudio] = useState(false);
+  const [lastCompletedPunch, setLastCompletedPunch] = useState<PunchType | null>(null);
   const [installReady, setInstallReady] = useState(false);
   const [installed, setInstalled] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -311,6 +311,12 @@ export default function FacialTerminal() {
     utterance.volume = 1;
     window.speechSynthesis.speak(utterance);
   }, [audio, statusMessage, token]);
+
+  useEffect(() => {
+    if (!audio && "speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
+  }, [audio]);
 
   const stopCamera = useCallback(() => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -785,6 +791,7 @@ export default function FacialTerminal() {
     punchTimerRef.current = window.setTimeout(() => {
       setCandidate(null);
       setAuthToken("");
+      setLastCompletedPunch(null);
       setState("idle");
       setMessage("Acércate a la cámara para registrar tu asistencia");
       punchTimerRef.current = null;
@@ -808,6 +815,7 @@ export default function FacialTerminal() {
           }),
         });
         punchCooldownUntilRef.current = Date.now() + PUNCH_COOLDOWN_MS;
+        setLastCompletedPunch(eventType);
         setState("success");
         setMessage(result.message || `${eventLabel} registrada correctamente.`);
         resetTerminal(4_000);
@@ -862,7 +870,6 @@ export default function FacialTerminal() {
         const employee = { ...result.employee, automatic_action: automaticAction } as Candidate;
         setCandidate(employee);
         setAuthToken(result.auth_token);
-        if (nextEvent) setPunchType(nextEvent);
         setState("recognized");
 
         if (automaticAction?.enabled && automaticAction.available && nextEvent) {
@@ -879,7 +886,11 @@ export default function FacialTerminal() {
           punchCooldownUntilRef.current = Date.now() + 4_500;
           resetTerminal(4_500);
         } else {
-          setMessage("Identidad confirmada · selecciona el tipo de marcaje.");
+          setMessage(
+            "Identidad confirmada · el modo automático no está activo en esta sucursal.",
+          );
+          punchCooldownUntilRef.current = Date.now() + 4_500;
+          resetTerminal(4_500);
         }
       } else if (result.status === "out_of_schedule") {
         setState("out_of_schedule");
@@ -914,10 +925,6 @@ export default function FacialTerminal() {
     };
   }, [token, cameraOn, recognize]);
 
-  function punch() {
-    if (!candidate || !authToken) return;
-    void recordPunch(candidate, authToken, punchType);
-  }
   function lock() {
     stopCamera();
     localStorage.removeItem(TOKEN_KEY);
@@ -943,8 +950,15 @@ export default function FacialTerminal() {
     else void document.exitFullscreen().catch(() => undefined);
   }
 
-  const selected = PUNCHES.find((item) => item.id === punchType) || PUNCHES[0];
-  const automaticMode = Boolean(config?.automatic_punch?.enabled);
+  const automaticConfigured = Boolean(config?.automatic_punch?.enabled);
+  const automaticAction = candidate?.automatic_action;
+  const activeAutomaticType =
+    state === "success"
+      ? lastCompletedPunch
+      : automaticAction?.event_type || null;
+  const activeAutomaticIndex = activeAutomaticType
+    ? PUNCHES.findIndex((item) => item.id === activeAutomaticType)
+    : -1;
   const statusColor =
     state === "success"
       ? "border-emerald-400 shadow-emerald-500/30"
@@ -1113,10 +1127,11 @@ export default function FacialTerminal() {
     );
 
   return (
-    <div className="relative flex h-screen w-screen select-none flex-col overflow-hidden bg-[#050811] font-sans text-slate-100">
+    <div className="cyber-shell relative flex h-screen w-screen select-none flex-col overflow-hidden bg-[#050811] font-sans text-slate-100">
+      <div className="cyber-grid pointer-events-none absolute inset-0 opacity-80" />
       <div className="pointer-events-none absolute -left-32 -top-32 h-96 w-96 rounded-full bg-cyan-600/10 blur-3xl" />
       <div className="pointer-events-none absolute -bottom-32 -right-32 h-96 w-96 rounded-full bg-blue-600/10 blur-3xl" />
-      <header className="z-20 flex w-full items-center justify-between border-b border-cyan-500/20 bg-slate-950/75 px-4 py-3 shadow-2xl backdrop-blur-xl sm:px-6">
+      <header className="z-20 flex w-full items-center justify-between border-b border-cyan-400/20 bg-slate-950/80 px-4 py-3 shadow-[0_8px_32px_rgba(2,8,23,.55)] backdrop-blur-xl sm:px-6">
         <div className="flex min-w-0 items-center gap-3">
           <div className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-gradient-to-tr from-cyan-600 to-blue-500">
             <div className="grid h-full w-full place-items-center rounded-[10px] bg-slate-950">
@@ -1174,9 +1189,11 @@ export default function FacialTerminal() {
             <ShieldAlert size={17} />
           </button>
           <button
-            title="Sonido"
+            title={audio ? "Desactivar sonido" : "Activar sonido solo si es obligatorio"}
+            aria-label={audio ? "Desactivar sonido" : "Activar sonido solo si es obligatorio"}
+            aria-pressed={audio}
             onClick={() => setAudio((value) => !value)}
-            className="hidden rounded-xl border border-slate-800 bg-slate-900/80 p-2 text-slate-300 sm:block"
+            className={`rounded-xl border p-2 transition ${audio ? "border-amber-400/50 bg-amber-400/10 text-amber-300" : "border-slate-800 bg-slate-900/80 text-slate-400 hover:border-cyan-400/50 hover:text-cyan-300"}`}
           >
             {audio ? <Volume2 size={17} /> : <VolumeX size={17} />}
           </button>
@@ -1202,6 +1219,9 @@ export default function FacialTerminal() {
           />
           <canvas ref={canvasRef} className="hidden" />
           <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-slate-950/35 via-transparent to-slate-950/80" />
+          <div className="pointer-events-none absolute inset-0 z-[1] overflow-hidden opacity-70">
+            <div className="cyber-scanline absolute inset-x-0 -top-1/4 h-1/3" />
+          </div>
           {!cameraOn && (
             <div className="z-10 flex flex-col items-center p-6 text-center">
               <CameraOff className="mb-3 text-rose-400" size={42} />
@@ -1220,7 +1240,7 @@ export default function FacialTerminal() {
             </div>
           )}
           <div
-              className={`relative z-10 flex h-64 w-52 items-center justify-center rounded-[42px] border-2 sm:h-80 sm:w-64 ${state === "success" ? "border-emerald-400 shadow-[0_0_40px_rgba(34,197,94,.45)]" : state === "error" || state === "out_of_zone" ? "border-rose-500 shadow-[0_0_40px_rgba(244,63,94,.35)]" : state === "recognized" ? "border-emerald-300 shadow-[0_0_40px_rgba(52,211,153,.45)]" : liveFaceState === "multiple" ? "border-rose-400" : "border-dashed border-cyan-400/50"}`}
+              className={`relative z-10 flex h-64 w-52 items-center justify-center rounded-[42px] border-2 bg-slate-950/10 sm:h-80 sm:w-64 ${state === "success" ? "border-emerald-400 shadow-[0_0_40px_rgba(34,197,94,.45)]" : state === "error" || state === "out_of_zone" ? "border-rose-500 shadow-[0_0_40px_rgba(244,63,94,.35)]" : state === "recognized" ? "border-emerald-300 shadow-[0_0_40px_rgba(52,211,153,.45)]" : liveFaceState === "multiple" ? "border-rose-400" : "border-dashed border-cyan-400/50 shadow-[0_0_30px_rgba(34,211,238,.12)]"}`}
           >
             <div className="absolute inset-7 rounded-full border border-cyan-300/30" />
             <div
@@ -1292,40 +1312,51 @@ export default function FacialTerminal() {
       </main>
       <footer className="z-20 w-full px-3 pb-3 sm:px-6">
         <div className="mx-auto max-w-5xl">
-          {automaticMode && (
-            <div className="rounded-2xl border border-indigo-400/40 bg-indigo-950/50 p-4 text-center">
-              <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-indigo-300">
-                MODO FÁCIL ACTIVADO
-              </p>
-              <p className="mt-1 text-xs text-slate-300">
-                La tablet elegirá el siguiente paso según tu asistencia y el
-                horario.
-              </p>
+          <div className="rounded-2xl border border-cyan-400/30 bg-slate-950/80 p-3 shadow-[0_0_28px_rgba(8,145,178,.12)] sm:p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <p className="text-[10px] font-black uppercase tracking-[0.24em] text-cyan-300">
+                  FLUJO AUTOMÁTICO · ALLSENDER FACIAL
+                </p>
+                <p className="mt-1 text-xs text-slate-400">
+                  La terminal consulta tu asistencia real y decide el siguiente marcaje.
+                </p>
+              </div>
+              <span className={`rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider ${automaticConfigured ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-300" : "border-amber-400/40 bg-amber-400/10 text-amber-300"}`}>
+                {automaticConfigured ? "AUTOMÁTICO ACTIVO" : "REQUIERE ACTIVACIÓN"}
+              </span>
             </div>
-          )}
-          {!automaticMode && (
-            <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4 sm:gap-3">
-              {PUNCHES.map((item) => {
+            <div className="mt-3 grid grid-cols-4 gap-1.5 sm:gap-2">
+              {PUNCHES.map((item, index) => {
                 const Icon = item.icon;
                 const style = PUNCH_STYLES[item.color];
-                const active = punchType === item.id;
+                const isCurrent = activeAutomaticIndex === index && state !== "success";
+                const isCompleted = activeAutomaticIndex > index || (state === "success" && activeAutomaticIndex === index);
                 return (
-                  <button
+                  <div
                     key={item.id}
-                    type="button"
-                    disabled={pairingBusy}
-                    aria-pressed={active}
-                    onClick={() => setPunchType(item.id)}
-                    className={`rounded-2xl border-2 p-3 text-left transition active:scale-95 ${active ? `${style.border} bg-slate-900/90` : "border-slate-800 bg-slate-900/60"} ${pairingBusy ? "cursor-not-allowed opacity-45" : "hover:border-slate-600"}`}
+                    className={`relative rounded-xl border p-2 text-center transition sm:p-3 ${isCurrent ? `${style.border} bg-cyan-500/10 shadow-[0_0_18px_rgba(34,211,238,.15)]` : isCompleted ? "border-emerald-400/40 bg-emerald-500/10" : "border-slate-800 bg-slate-900/50"}`}
                   >
-                    <Icon className={`mb-1 ${style.text}`} size={20} />
-                    <p className="text-sm font-black">{item.label}</p>
-                    <p className="text-[10px] text-slate-400">{item.desc}</p>
-                  </button>
+                    <Icon className={`mx-auto mb-1 ${isCurrent ? style.text : isCompleted ? "text-emerald-300" : "text-slate-500"}`} size={17} />
+                    <p className={`text-[10px] font-black sm:text-xs ${isCurrent ? "text-cyan-200" : isCompleted ? "text-emerald-200" : "text-slate-400"}`}>
+                      {item.label}
+                    </p>
+                    <p className="mt-0.5 hidden text-[9px] text-slate-500 sm:block">{item.desc}</p>
+                    {isCurrent && <span className="absolute -right-1 -top-1 h-2 w-2 animate-pulse rounded-full bg-cyan-300" />}
+                  </div>
                 );
               })}
             </div>
-          )}
+            <p className="mt-3 text-center text-[11px] text-slate-400">
+              {state === "success" && lastCompletedPunch
+                ? `${PUNCHES.find((item) => item.id === lastCompletedPunch)?.label} registrado. La terminal vuelve a esperar.`
+                : automaticAction?.event_type
+                  ? `Siguiente paso: ${automaticAction.label}. ${automaticAction.description || "Colócate frente a la cámara."}`
+                  : automaticConfigured
+                    ? automaticAction?.reason || "Acércate a la cámara; el sistema indicará cuándo corresponde marcar."
+                    : "Activa el reconocimiento automático en la configuración de esta sucursal para eliminar la selección manual."}
+            </p>
+          </div>
           <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-800 bg-slate-950/80 px-3 py-2">
             <div className="flex items-center gap-2 text-xs text-slate-400">
               <Crosshair size={14} className="text-cyan-400" />
@@ -1334,15 +1365,6 @@ export default function FacialTerminal() {
               {config.schedule.end || "—"}
               {config.terminal.within_branch_zone === false ? " · Tablet fuera de zona" : " · Tablet en zona"}
             </div>
-            {state === "recognized" && !automaticMode && candidate && (
-                <button
-                  onClick={() => void punch()}
-                  className="rounded-xl bg-emerald-500 px-4 py-2 text-xs font-black text-slate-950"
-                >
-                  <Check className="mr-1 inline" size={15} />
-                  Confirmar {selected.label}
-                </button>
-              )}
             <span className="text-[10px] text-slate-500">
               {config.battery.alert_enabled
                 ? `Alerta ≤${config.battery.threshold}%`
